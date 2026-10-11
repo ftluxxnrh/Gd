@@ -1,0 +1,21 @@
+name: Build Dylib
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compile Dylib
+        run: |
+          xcrun -sdk iphoneos clang -arch arm64 -shared \
+            -framework UIKit -framework Foundation \
+            -o MagicHook.dylib main.m
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MagicHook-dylib
+          path: MagicHook.dylib
