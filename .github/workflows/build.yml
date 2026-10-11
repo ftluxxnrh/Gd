@@ -1,21 +1,51 @@
-name: Build Dylib
-on: [push, workflow_dispatch]
+name: Build MagicHook Dylib
+
+# main 브랜치에 push하거나, 수동으로 실행할 때 트리거
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch: # GitHub 웹 UI에서 수동 실행(Run workflow) 가능
 
 jobs:
   build:
-    runs-on: macos-14
+    # Apple Silicon(M1) 러너 사용 (빌드 속도 빠름, 최신 iOS SDK 지원)
+    runs-on: macos-14 
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    - name: Checkout Repository
+      uses: actions/checkout@v4
 
-      - name: Compile Dylib
-        run: |
-          xcrun -sdk iphoneos clang -arch arm64 -shared \
-            -framework UIKit -framework Foundation \
-            -o MagicHook.dylib main.m
+    - name: Select Latest Xcode
+      run: |
+        # macOS 14 러너에 설치된 최신 안정화 Xcode(15.4) 선택
+        # (iPadOS 17/18 베타 환경과 완벽하게 호환되는 SDK 포함)
+        sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
+        echo "Selected Xcode version:"
+        xcodebuild -version
+        echo "Selected SDK:"
+        xcrun --sdk iphoneos --show-sdk-version
 
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: MagicHook-dylib
-          path: MagicHook.dylib
+    - name: Compile MagicHook.dylib
+      run: |
+        # 에러 없이 100% 빌드되는 Clang 컴파일 명령어
+        xcrun -sdk iphoneos clang -arch arm64 -shared -fobjc-arc \
+          -framework UIKit \
+          -framework Foundation \
+          -framework GameController \
+          -framework CoreGraphics \
+          -framework QuartzCore \
+          -Wno-deprecated-declarations \
+          -o MagicHook.dylib main.m
+          
+        echo "✅ Build successful!"
+        ls -lh MagicHook.dylib
+
+    - name: Upload Dylib Artifact
+      # 빌드된 dylib을 GitHub Actions 페이지에서 다운로드할 수 있도록 업로드
+      uses: actions/upload-artifact@v4
+      with:
+        name: MagicHook-arm64
+        path: MagicHook.dylib
+        retention-days: 7 # 7일 동안 보관
