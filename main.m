@@ -1,151 +1,123 @@
 #import <UIKit/UIKit.h>
+#import <GameController/GameController.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-#define KEY_RIGHT_OPTION    0xE6  // 오른쪽 옵션
-#define KEY_SPACE           0x2C  // 스페이스바
-#define KEY_ESCAPE          0x29  // ESC
-#define KEY_ARROW_LEFT      0x50  // 왼쪽 화살표
-#define KEY_ARROW_RIGHT     0x4F  // 오른쪽 화살표
-
-// ------------------------------------------
-// 컴파일러 차단을 우회하는 가상 터치 객체
-// ------------------------------------------
-@interface GDFakeTouch : UITouch
-@property (nonatomic, assign) CGPoint customLocation;
-@property (nonatomic, assign) UITouchPhase customPhase;
-@end
-
-@implementation GDFakeTouch
-- (instancetype)init {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wunavailable-declarations"
-    self = [super init];
-#pragma clang diagnostic pop
-    return self;
+// CCEAGLView 동적 탐색 함수
+static UIView* findEAGLView() {
+    UIWindow *window = UIApplication.sharedApplication.windows.firstObject;
+    if (!window) return nil;
+    
+    for (UIView *subview in window.subviews) {
+        // GD의 OpenGL 뷰는 보통 CCEAGLView 또는 EAGLView 클래스명을 가집니다.
+        if ([NSStringFromClass([subview class]) containsString:@"EAGLView"]) {
+            return subview;
+        }
+    }
+    return window; // 못 찾을 경우 최상위 뷰에 전달
 }
-- (CGPoint)locationInView:(UIView *)view { return self.customLocation; }
-- (CGPoint)previousLocationInView:(UIView *)view { return self.customLocation; }
-- (UITouchPhase)phase { return self.customPhase; }
-@end
 
-static GDFakeTouch *g_jumpTouch = nil;
+// 인풋렉 없는 터치 합성 및 주입 함수
+static void injectTouch(UIView *targetView, UITouchPhase phase, CGPoint location) {
+    if (!targetView) return;
+    
+    Class touchClass = NSClassFromString(@"UITouch");
+    
+    // 1. NS_UNAVAILABLE 우회: alloc 호출
+    id touch = ((id (*)(Class, SEL))objc_msgSend)(touchClass, sel_registerName("alloc"));
+    
+    // 2. Private Initializer 호출: _initInView:
+    SEL initSel = sel_registerName("_initInView:");
+    if ([touch respondsToSelector:initSel]) {
+        touch = ((id (*)(id, SEL, UIView *))objc_msgSend)(touch, initSel, targetView);
+    } else {
+        return; // iOS 버전에 따라 셀렉터가 다를 수 있음 (기본적으로 iOS 14~17 지원)
+    }
 
-// ------------------------------------------
-// 카테고리 인터페이스 전방 선언
-// ------------------------------------------
-@interface UIResponder (GDMagicKeyboardHook)
-- (UIView *)gd_findTargetView:(UIWindow *)window;
-- (void)gd_dispatchTouchOnWindow:(UIWindow *)window phase:(UITouchPhase)phase isJump:(BOOL)isJump point:(CGPoint)point;
-- (void)gd_dispatchClickOnWindow:(UIWindow *)window point:(CGPoint)point;
-@end
+    // 3. 터치 속성 설정 (Private Setter 직접 호출)
+    ((void (*)(id, SEL, NSInteger))objc_msgSend)(touch, sel_registerName("setPhase:"), phase);
+    ((void (*)(id, SEL, CGPoint))objc_msgSend)(touch, sel_registerName("setLocationInWindow:"), location);
+    ((void (*)(id, SEL, CGPoint))objc_msgSend)(touch, sel_registerName("setPreviousLocationInWindow:"), location);
+    ((void (*)(id, SEL, double))objc_msgSend)(touch, sel_registerName("setTimestamp:"), CACurrentMediaTime());
+    
+    // Window 설정
+    Ivar windowIvar = class_getInstanceVariable(touchClass, "_window");
+    if (windowIvar) {
+        object_setIvar(touch, windowIvar, targetView.window);
+    }
 
-@implementation UIResponder (GDMagicKeyboardHook)
+    // 4. 유효한 UIEvent 확보
+    UIEvent *event = ((UIEvent *(*)(id, SEL))objc_msgSend)(UIApplication.sharedApplication, sel_registerName("_touchesEvent"));
+    NSSet *touches = [NSSet setWithObject:touch];
 
-+ (void)load {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        Class class = [UIResponder class];
+    // 5. Cocos2d-x 뷰에 직접 전달 (Hit-test 우회로 0ms 지연 달성)
+    if (phase == UITouchPhaseBegan) {
+        [targetView touchesBegan:touches withEvent:event];
+    } else if (phase == UITouchPhaseEnded) {
+        [targetView touchesEnded:touches withEvent:event];
+    }
+}
+
+// Dylib 엔트리 포인트
+__attribute__((constructor)) static void initMagicHook() {
+    // 앱 실행 후 UI가 로드될 시간을 약간 줌
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         
-        SEL origBegan = @selector(pressesBegan:withEvent:);
-        SEL swizBegan = @selector(gd_pressesBegan:withEvent:);
-        method_exchangeImplementations(class_getInstanceMethod(class, origBegan),
-                                       class_getInstanceMethod(class, swizBegan));
+        // GCKeyboard를 이용한 전역 하드웨어 키 후킹
+        GCKeyboard *keyboard = GCKeyboard.coalescedKeyboard;
+        if (!keyboard) {
+            NSLog(@"[MagicHook] GCKeyboard를 찾을 수 없습니다.");
+            return;
+        }
         
-        SEL origEnded = @selector(pressesEnded:withEvent:);
-        SEL swizEnded = @selector(gd_pressesEnded:withEvent:);
-        method_exchangeImplementations(class_getInstanceMethod(class, origEnded),
-                                       class_getInstanceMethod(class, swizEnded));
+        keyboard.keyboardInput.keyChangedHandler = ^(GCKeyboardInput *keyboard, GCControllerButtonInput *key, GCKeyCode keyCode, BOOL pressed) {
+            
+            // 메인 스레드에서 UIKit 작업 수행 (크래시 방지)
+            dispatch_async(dispatch_get_main_queue(), ^{
+                UIView *glView = findEAGLView();
+                if (!glView) return;
+                
+                CGRect bounds = glView.bounds;
+                
+                if (keyCode == GCKeyCodeSpacebar || keyCode == GCKeyCodeRightAlt) {
+                    // 점프: 화면 중앙 하단 터치
+                    CGPoint jumpPoint = CGPointMake(bounds.size.width / 2.0, bounds.size.height - 100.0);
+                    injectTouch(glView, pressed ? UITouchPhaseBegan : UITouchPhaseEnded, jumpPoint);
+                    
+                } else if (keyCode == GCKeyCodeEscape) {
+                    // 일시정지: 화면 좌측 상단 터치 (GD Pause 버튼 위치)
+                    if (pressed) {
+                        CGPoint pausePoint = CGPointMake(40.0, 40.0);
+                        injectTouch(glView, UITouchPhaseBegan, pausePoint);
+                        // 뗌 이벤트는 약간의 딜레이 후 주입 (인식률 향상)
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                            injectTouch(glView, UITouchPhaseEnded, pausePoint);
+                        });
+                    }
+                    
+                } else if (keyCode == GCKeyCodeLeftArrow) {
+                    // 페이지 왼쪽 넘기기
+                    if (pressed) {
+                        CGPoint leftPoint = CGPointMake(50.0, bounds.size.height / 2.0);
+                        injectTouch(glView, UITouchPhaseBegan, leftPoint);
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                            injectTouch(glView, UITouchPhaseEnded, leftPoint);
+                        });
+                    }
+                    
+                } else if (keyCode == GCKeyCodeRightArrow) {
+                    // 페이지 오른쪽 넘기기
+                    if (pressed) {
+                        CGPoint rightPoint = CGPointMake(bounds.size.width - 50.0, bounds.size.height / 2.0);
+                        injectTouch(glView, UITouchPhaseBegan, rightPoint);
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                            injectTouch(glView, UITouchPhaseEnded, rightPoint);
+                        });
+                    }
+                }
+            });
+        };
+        
+        NSLog(@"[MagicHook] Successfully initialized GCKeyboard hook.");
     });
 }
-
-// 키 누름 (KeyDown)
-- (void)gd_pressesBegan:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event {
-    if ([self isKindOfClass:[UIWindow class]]) {
-        UIWindow *window = (UIWindow *)self;
-        for (UIPress *press in presses) {
-            NSInteger code = press.key.keyCode;
-            
-            // 점프 누름
-            if (code == KEY_RIGHT_OPTION || code == KEY_SPACE) {
-                [self gd_dispatchTouchOnWindow:window phase:UITouchPhaseBegan isJump:YES point:CGPointZero];
-                return;
-            }
-            
-            // ESC (일시정지)
-            if (code == KEY_ESCAPE) {
-                [self gd_dispatchClickOnWindow:window point:CGPointMake(40, 40)];
-                return;
-            }
-            
-            // 화살표 (페이지 이동)
-            if (code == KEY_ARROW_LEFT) {
-                CGPoint leftPoint = CGPointMake(40, window.bounds.size.height / 2.0);
-                [self gd_dispatchClickOnWindow:window point:leftPoint];
-                return;
-            }
-            if (code == KEY_ARROW_RIGHT) {
-                CGPoint rightPoint = CGPointMake(window.bounds.size.width - 40, window.bounds.size.height / 2.0);
-                [self gd_dispatchClickOnWindow:window point:rightPoint];
-                return;
-            }
-        }
-    }
-    [self gd_pressesBegan:presses withEvent:event];
-}
-
-// 키 뗌 (KeyUp)
-- (void)gd_pressesEnded:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event {
-    if ([self isKindOfClass:[UIWindow class]]) {
-        UIWindow *window = (UIWindow *)self;
-        for (UIPress *press in presses) {
-            NSInteger code = press.key.keyCode;
-            if (code == KEY_RIGHT_OPTION || code == KEY_SPACE) {
-                [self gd_dispatchTouchOnWindow:window phase:UITouchPhaseEnded isJump:YES point:CGPointZero];
-                return;
-            }
-        }
-    }
-    [self gd_pressesEnded:presses withEvent:event];
-}
-
-// 헬퍼 메서드 구현
-- (UIView *)gd_findTargetView:(UIWindow *)window {
-    UIView *rootView = window.rootViewController.view;
-    return rootView ? rootView : window;
-}
-
-- (void)gd_dispatchTouchOnWindow:(UIWindow *)window phase:(UITouchPhase)phase isJump:(BOOL)isJump point:(CGPoint)point {
-    UIView *targetView = [self gd_findTargetView:window];
-    
-    if (isJump) {
-        if (phase == UITouchPhaseBegan) {
-            if (!g_jumpTouch) {
-                g_jumpTouch = [[GDFakeTouch alloc] init];
-            }
-            g_jumpTouch.customLocation = CGPointMake(targetView.bounds.size.width / 2.0, targetView.bounds.size.height / 2.0);
-            g_jumpTouch.customPhase = UITouchPhaseBegan;
-            [targetView touchesBegan:[NSSet setWithObject:g_jumpTouch] withEvent:nil];
-        } else if (phase == UITouchPhaseEnded) {
-            if (g_jumpTouch) {
-                g_jumpTouch.customPhase = UITouchPhaseEnded;
-                [targetView touchesEnded:[NSSet setWithObject:g_jumpTouch] withEvent:nil];
-            }
-        }
-    }
-}
-
-- (void)gd_dispatchClickOnWindow:(UIWindow *)window point:(CGPoint)point {
-    UIView *targetView = [self gd_findTargetView:window];
-    GDFakeTouch *clickTouch = [[GDFakeTouch alloc] init];
-    clickTouch.customLocation = point;
-    clickTouch.customPhase = UITouchPhaseBegan;
-    [targetView touchesBegan:[NSSet setWithObject:clickTouch] withEvent:nil];
-    
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        clickTouch.customPhase = UITouchPhaseEnded;
-        [targetView touchesEnded:[NSSet setWithObject:clickTouch] withEvent:nil];
-    });
-}
-
-@end
